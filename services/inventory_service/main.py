@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 
 from shared.event_bus import InMemoryEventBus, RabbitMQEventBus, build_event_bus
 from shared.events import EventEnvelope, EventType, new_event
@@ -21,7 +21,21 @@ INITIAL_STOCK: dict[str, int] = {
     "snack": 40,
 }
 stock: dict[str, int] = INITIAL_STOCK.copy()
-reservations: dict[str, list[dict[str, object]]] = {}
+reservations: dict[str, dict[str, object]] = {}
+
+
+def stock_item(sku: str, stock_state: dict[str, int] = stock) -> dict[str, object]:
+    if sku not in stock_state:
+        raise HTTPException(status_code=404, detail="Stock item not found")
+    return {"sku": sku, "quantity": stock_state[sku]}
+
+
+def low_stock_items(threshold: int, stock_state: dict[str, int] = stock) -> list[dict[str, object]]:
+    return [
+        {"sku": sku, "quantity": quantity}
+        for sku, quantity in sorted(stock_state.items())
+        if quantity <= threshold
+    ]
 
 
 def _database_enabled() -> bool:
@@ -100,7 +114,7 @@ async def handle_order_paid(
     event: EventEnvelope,
     event_bus: InMemoryEventBus | RabbitMQEventBus,
     stock_state: dict[str, int] = stock,
-    reservation_state: dict[str, list[dict[str, object]]] = reservations,
+    reservation_state: dict[str, dict[str, object]] = reservations,
 ) -> None:
     if event.aggregate_id in reservation_state or await _has_inventory_decision(event.aggregate_id):
         return
@@ -132,16 +146,22 @@ async def handle_order_paid(
         current_stock[sku] -= quantity
         reserved_items.append({"sku": sku, "quantity": quantity})
 
+    reservation = {
+        "order_id": event.aggregate_id,
+        "items": reserved_items,
+        "status": "Reserved",
+        "correlation_id": event.correlation_id,
+    }
     if current_stock is not stock_state:
         stock_state.clear()
         stock_state.update(current_stock)
-    reservation_state[event.aggregate_id] = reserved_items
+    reservation_state[event.aggregate_id] = reservation
     await event_bus.publish(
         new_event(
             EventType.INVENTORY_RESERVED,
             aggregate_id=event.aggregate_id,
             source=settings.service_name,
-            payload={"order_id": event.aggregate_id, "items": reserved_items},
+            payload=reservation,
             correlation_id=event.correlation_id,
         )
     )
@@ -187,6 +207,26 @@ async def get_stock() -> dict[str, int]:
     return await _stock_from_event_log()
 
 
+@app.get("/stock/low")
+async def get_low_stock(threshold: int = Query(default=10, ge=0)) -> list[dict[str, object]]:
+    return low_stock_items(threshold, await _stock_from_event_log())
+
+
+@app.get("/stock/{sku}")
+async def get_stock_item(sku: str) -> dict[str, object]:
+    return stock_item(sku, await _stock_from_event_log())
+
+
 @app.get("/reservations")
-async def list_inventory_reservations() -> dict[str, list[dict[str, object]]]:
-    return await _inventory_reservations_from_event_log()
+async def list_inventory_reservations() -> dict[str, dict[str, object]]:
+    if not _database_enabled():
+        return reservations
+    hydrated = await _inventory_reservations_from_event_log()
+    return {
+        order_id: {
+            "order_id": order_id,
+            "items": items,
+            "status": "Reserved",
+        }
+        for order_id, items in hydrated.items()
+    }
