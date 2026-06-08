@@ -7,8 +7,9 @@ from fastapi import FastAPI, HTTPException, Query, Request
 
 from shared.event_bus import InMemoryEventBus, RabbitMQEventBus, build_event_bus
 from shared.events import EventEnvelope, EventType, new_event
-from shared.logging import configure_logging, log_event
+from shared.logging import configure_logging, install_api_logging, log_event
 from shared.settings import get_settings
+from shared.tenancy import DEFAULT_STORE_ID, store_id_from_event_payload, store_id_from_request
 
 
 settings = get_settings("inventory-service")
@@ -67,28 +68,28 @@ def _has_inventory_decision_sync(order_id: str) -> bool:
     return row is not None
 
 
-async def _stock_from_event_log() -> dict[str, int]:
+async def _stock_from_event_log(store_id: str = DEFAULT_STORE_ID) -> dict[str, int]:
     if not _database_enabled():
         return stock
-    return await asyncio.to_thread(_stock_from_event_log_sync)
+    return await asyncio.to_thread(_stock_from_event_log_sync, store_id)
 
 
-def _stock_from_event_log_sync() -> dict[str, int]:
+def _stock_from_event_log_sync(store_id: str) -> dict[str, int]:
     current = INITIAL_STOCK.copy()
-    for items in _inventory_reservations_from_event_log_sync().values():
+    for items in _inventory_reservations_from_event_log_sync(store_id).values():
         for item in items:
             sku = str(item["sku"])
             current[sku] = current.get(sku, 0) - int(item["quantity"])
     return current
 
 
-async def _inventory_reservations_from_event_log() -> dict[str, list[dict[str, object]]]:
+async def _inventory_reservations_from_event_log(store_id: str = DEFAULT_STORE_ID) -> dict[str, list[dict[str, object]]]:
     if not _database_enabled():
         return reservations
-    return await asyncio.to_thread(_inventory_reservations_from_event_log_sync)
+    return await asyncio.to_thread(_inventory_reservations_from_event_log_sync, store_id)
 
 
-def _inventory_reservations_from_event_log_sync() -> dict[str, list[dict[str, object]]]:
+def _inventory_reservations_from_event_log_sync(store_id: str) -> dict[str, list[dict[str, object]]]:
     import psycopg
     from psycopg.rows import dict_row
 
@@ -97,10 +98,11 @@ def _inventory_reservations_from_event_log_sync() -> dict[str, list[dict[str, ob
             """
             SELECT aggregate_id, payload
             FROM event_log
-            WHERE event_type = %s
+            WHERE store_id = %s
+              AND event_type = %s
             ORDER BY occurred_at ASC, created_at ASC
             """,
-            (str(EventType.INVENTORY_RESERVED),),
+            (store_id, str(EventType.INVENTORY_RESERVED)),
         ).fetchall()
 
     return {
@@ -119,8 +121,9 @@ async def handle_order_paid(
     if event.aggregate_id in reservation_state or await _has_inventory_decision(event.aggregate_id):
         return
 
+    store_id = store_id_from_event_payload(event.payload)
     items = event.payload["items"]
-    current_stock = await _stock_from_event_log() if _database_enabled() else stock_state
+    current_stock = await _stock_from_event_log(store_id) if _database_enabled() else stock_state
     shortages = [
         {"sku": item["sku"], "requested": item["quantity"], "available": current_stock.get(item["sku"], 0)}
         for item in items
@@ -132,7 +135,7 @@ async def handle_order_paid(
                 EventType.INVENTORY_SHORTAGE_DETECTED,
                 aggregate_id=event.aggregate_id,
                 source=settings.service_name,
-                payload={"order_id": event.aggregate_id, "shortages": shortages},
+                payload={"order_id": event.aggregate_id, "store_id": store_id, "shortages": shortages},
                 correlation_id=event.correlation_id,
             )
         )
@@ -148,6 +151,7 @@ async def handle_order_paid(
 
     reservation = {
         "order_id": event.aggregate_id,
+        "store_id": store_id,
         "items": reserved_items,
         "status": "Reserved",
         "correlation_id": event.correlation_id,
@@ -191,6 +195,7 @@ app = FastAPI(
     description="Stock reservation and shortage events.",
     lifespan=lifespan,
 )
+install_api_logging(app, logger, settings.service_name)
 
 
 @app.get("/health")
@@ -203,25 +208,25 @@ async def health(request: Request) -> dict[str, object]:
 
 
 @app.get("/stock")
-async def get_stock() -> dict[str, int]:
-    return await _stock_from_event_log()
+async def get_stock(request: Request) -> dict[str, int]:
+    return await _stock_from_event_log(store_id_from_request(request))
 
 
 @app.get("/stock/low")
-async def get_low_stock(threshold: int = Query(default=10, ge=0)) -> list[dict[str, object]]:
-    return low_stock_items(threshold, await _stock_from_event_log())
+async def get_low_stock(request: Request, threshold: int = Query(default=10, ge=0)) -> list[dict[str, object]]:
+    return low_stock_items(threshold, await _stock_from_event_log(store_id_from_request(request)))
 
 
 @app.get("/stock/{sku}")
-async def get_stock_item(sku: str) -> dict[str, object]:
-    return stock_item(sku, await _stock_from_event_log())
+async def get_stock_item(sku: str, request: Request) -> dict[str, object]:
+    return stock_item(sku, await _stock_from_event_log(store_id_from_request(request)))
 
 
 @app.get("/reservations")
-async def list_inventory_reservations() -> dict[str, dict[str, object]]:
+async def list_inventory_reservations(request: Request) -> dict[str, dict[str, object]]:
     if not _database_enabled():
         return reservations
-    hydrated = await _inventory_reservations_from_event_log()
+    hydrated = await _inventory_reservations_from_event_log(store_id_from_request(request))
     return {
         order_id: {
             "order_id": order_id,
