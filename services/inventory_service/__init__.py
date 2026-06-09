@@ -1,2 +1,1 @@
-"""Inventory service."""
-
+"""Dịch vụ Inventory."""
