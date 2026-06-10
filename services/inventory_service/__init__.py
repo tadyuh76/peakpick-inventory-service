@@ -1,1 +1,2 @@
-"""Dịch vụ Inventory."""
+"""Inventory service."""
+
