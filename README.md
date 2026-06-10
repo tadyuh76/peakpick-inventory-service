@@ -1,12 +1,28 @@
 # PeakPick Inventory Service
 
-Owns inventory reservation decisions. It consumes `OrderPaid` and publishes either `InventoryReserved` or `InventoryShortageDetected`.
+Inventory Service là microservice quyết định giữ hàng và trừ tồn cho đơn đã thanh toán.
 
-Owned database tables:
+## Database Riêng
 
-- local `event_log`
+Service này sở hữu database `peakpick_inventory` với bảng:
 
-Run locally:
+- `event_log`
+
+Trong prototype, tồn kho được mô phỏng đủ đơn giản để dễ demo và giải thích.
+
+## Event
+
+Nhận event:
+
+- `OrderPaid`
+- `OrderPickedUp`
+
+Phát event:
+
+- `InventoryReserved`
+- `InventoryShortageDetected`
+
+## Chạy Local
 
 ```bash
 pip install -r requirements.txt
